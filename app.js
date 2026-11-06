@@ -1,36 +1,39 @@
 /* =====================================================================
    Bridgewater PTC – Site Visibility Calendar
    ---------------------------------------------------------------------
-   SETTINGS: paste your Supabase values below (Project Settings > API).
-   Leave them blank to run in DEMO mode (passkey: demo, data on this
-   device only). See README.md for the database setup.
+   SHARED SAVING (all devices see the same data):
+   Paste your Supabase values below (Supabase > Project Settings > API).
+   See README.md for the 5-minute setup.
+
+   If these are left blank the calendar runs in LOCAL mode: entries are
+   saved only in this one browser and will NOT show on other devices.
    ===================================================================== */
 const SETTINGS = {
   SUPABASE_URL: "",        // e.g. "https://abcdxyz.supabase.co"
   SUPABASE_ANON_KEY: "",   // the "anon public" key (never the service_role key)
-  REFRESH_SECONDS: 60      // how often the TV pulls new data
+  TABLE: "entries",
+  REFRESH_SECONDS: 30      // how often each screen pulls new data
 };
 
 (() => {
   "use strict";
-
   const CFG = SETTINGS;
-  const DEMO = !CFG.SUPABASE_URL || !CFG.SUPABASE_ANON_KEY;
-  const TYPES = {
-    event:      { label: "EVENT",      add: "ADD EVENT" },
-    contractor: { label: "CONTRACTOR", add: "ADD CONTRACTOR" },
-    pto:        { label: "PTO / OOO",  add: "ADD PTO / OOO" }
-  };
-  const WD = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"];
-  const WD_LONG = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"];
+  const CLOUD = !!(CFG.SUPABASE_URL && CFG.SUPABASE_ANON_KEY);
 
+  const TYPES = {
+    event:      { label: "Event",      add: "Add event" },
+    contractor: { label: "Contractor", add: "Add contractor visit" },
+    pto:        { label: "PTO / OOO",  add: "Add PTO / OOO" }
+  };
+  const WD = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+  const WD_LONG = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
   const state = { view: "month", filter: "all", focus: today(), entries: [] };
 
   // ---------- Date helpers ----------
   const pad = n => String(n).padStart(2, "0");
   function today() { const d = new Date(); return new Date(d.getFullYear(), d.getMonth(), d.getDate()); }
   const ymd = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-  const parse = s => { const [y, m, d] = s.split("-").map(Number); return new Date(y, m - 1, d); };
+  const parse = s => { const [y, m, d] = String(s).slice(0, 10).split("-").map(Number); return new Date(y, m - 1, d); };
   const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
   const mondayOf = d => addDays(d, -((d.getDay() + 6) % 7));
   const sameDay = (a, b) => ymd(a) === ymd(b);
@@ -42,7 +45,6 @@ const SETTINGS = {
   const fmtShort = d => d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
   const fmtLong = d => d.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" });
   const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-
   const isAllDay = e => e.all_day || !e.start_time;
   function timeText(e) {
     if (isAllDay(e)) return "All day";
@@ -52,29 +54,114 @@ const SETTINGS = {
     const s = parse(e.start_date), en = parse(e.end_date);
     return e.start_date === e.end_date ? fmtLong(s) : `${fmtShort(s)} – ${fmtShort(en)}, ${en.getFullYear()}`;
   }
-  const displayTitle = e => (e.type === "pto" ? `${e.title} OOO` : e.title);
+  // Title shown as-is (no "OOO" suffix – the category already says it)
+  const displayTitle = e => e.title;
 
   // ---------- Data API ----------
-  const API = {
-    all() { try { return JSON.parse(localStorage.getItem("bvc_demo_entries")) || []; } catch { return []; } },
-    set(list) { localStorage.setItem("bvc_demo_entries", JSON.stringify(list)); },
+  // Normalises a record so blanks go to the database as NULL
+  function clean(entry) {
+    const out = {};
+    ["type", "title", "purpose", "start_date", "end_date", "all_day", "start_time", "end_time", "location", "host", "notes"]
+      .forEach(k => { out[k] = entry[k] === "" || entry[k] === undefined ? null : entry[k]; });
+    out.all_day = !!entry.all_day;
+    return out;
+  }
+
+  const LocalAPI = {
+    key: "bvc_entries",
+    all() { try { return JSON.parse(localStorage.getItem(this.key)) || []; } catch { return []; } },
+    set(list) { localStorage.setItem(this.key, JSON.stringify(list)); },
     async list(from, to) { return this.all().filter(e => e.start_date <= to && e.end_date >= from); },
-    async save(entry) { const all=this.all(); if(entry.id){const i=all.findIndex(x=>x.id===entry.id); if(i>=0) all[i]=entry;} else {entry.id=crypto.randomUUID?crypto.randomUUID():String(Date.now()); all.push(entry);} this.set(all); return entry; },
+    async save(entry) {
+      const all = this.all(), rec = { ...clean(entry), id: entry.id || (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())) };
+      const i = all.findIndex(x => x.id === rec.id);
+      if (i >= 0) all[i] = rec; else all.push(rec);
+      this.set(all); return rec;
+    },
     async remove(id) { this.set(this.all().filter(x => x.id !== id)); }
   };
+
+  const CloudAPI = {
+    base: `${String(CFG.SUPABASE_URL).replace(/\/+$/, "")}/rest/v1/${CFG.TABLE}`,
+    async req(path, opts = {}) {
+      const res = await fetch(this.base + path, {
+        ...opts,
+        headers: {
+          apikey: CFG.SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${CFG.SUPABASE_ANON_KEY}`,
+          "Content-Type": "application/json",
+          Prefer: "return=representation",
+          ...(opts.headers || {})
+        }
+      });
+      if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+      return res.status === 204 ? null : res.json();
+    },
+    async list(from, to) {
+      return this.req(`?select=*&start_date=lte.${to}&end_date=gte.${from}&order=start_date.asc`);
+    },
+    async save(entry) {
+      const body = JSON.stringify(clean(entry));
+      const rows = entry.id
+        ? await this.req(`?id=eq.${encodeURIComponent(entry.id)}`, { method: "PATCH", body })
+        : await this.req("", { method: "POST", body });
+      return rows && rows[0];
+    },
+    async remove(id) { await this.req(`?id=eq.${encodeURIComponent(id)}`, { method: "DELETE" }); }
+  };
+
+  const API = CLOUD ? CloudAPI : LocalAPI;
+
+  // One-time: push any entries saved locally on this device up to the shared calendar
+  async function migrateLocal() {
+    if (!CLOUD || localStorage.getItem("bvc_migrated") === "1") return;
+    const local = [...LocalAPI.all(), ...(JSON.parse(localStorage.getItem("bvc_demo_entries") || "[]"))];
+    try {
+      for (const e of local) if (e && e.title && e.start_date) await CloudAPI.save({ ...e, id: "" });
+      localStorage.setItem("bvc_migrated", "1");
+    } catch (err) { console.warn("Local migration skipped:", err); }
+  }
+
   // ---------- DOM ----------
   const $ = id => document.getElementById(id);
-  const els = { app: $("app"), cal: $("calendar"), period: $("periodLabel"), modal: $("modal"), modalCard: $("modalCard"), todayBox: $("todayBox"), todayBody: $("todayBody"), todayCounts: $("todayCounts"), status: $("status") };
-  function handleError() { els.status.textContent = "Could not load calendar data."; }
+  const els = {
+    app: $("app"), cal: $("calendar"), period: $("periodLabel"), modal: $("modal"), modalCard: $("modalCard"),
+    todayBox: $("todayBox"), todayBody: $("todayBody"), todayCounts: $("todayCounts"), status: $("status"), sync: $("syncBadge")
+  };
+
+  function setSync(ok) {
+    if (!CLOUD) {
+      els.sync.className = "sync local";
+      els.sync.textContent = "Local only – not shared across devices";
+    } else {
+      els.sync.className = "sync " + (ok ? "live" : "err");
+      els.sync.textContent = ok ? "Shared · live" : "Connection issue";
+    }
+  }
+  function handleError(err) {
+    console.error(err);
+    setSync(false);
+    els.status.textContent = "Could not reach the shared calendar – retrying.";
+  }
+
   let refreshTimer = null;
-  function boot() { els.app.classList.remove("hidden"); if(localStorage.getItem("bvc_today_open")==="1") els.todayBox.classList.add("open"); tickClock(); render(); load(); clearInterval(refreshTimer); refreshTimer=setInterval(()=>{if(els.modal.classList.contains("hidden")) load();},(CFG.REFRESH_SECONDS||60)*1000); }
+  async function boot() {
+    if (localStorage.getItem("bvc_today_open") === "1") els.todayBox.classList.add("open");
+    setSync(true);
+    tickClock(); render();
+    await migrateLocal();
+    load();
+    clearInterval(refreshTimer);
+    refreshTimer = setInterval(() => { if (els.modal.classList.contains("hidden")) load(); }, (CFG.REFRESH_SECONDS || 30) * 1000);
+  }
+
   // ---------- Clock ----------
   let lastDay = ymd(today());
   function tickClock() {
     const n = new Date();
-    $("nowDate").textContent = n.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" });
+    $("nowDate").textContent = n.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" });
     $("nowTime").textContent = n.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-    if (ymd(today()) !== lastDay) { // midnight rollover keeps the TV current
+    if (ymd(today()) !== lastDay) {
       if (sameDay(state.focus, parse(lastDay))) state.focus = today();
       lastDay = ymd(today()); render(); load();
     }
@@ -91,9 +178,10 @@ const SETTINGS = {
   }
   async function load() {
     const [s, e] = visibleRange(), t = today();
-    const from = ymd(s < t ? s : t), to = ymd(e > t ? e : t); // always include today for the summary
+    const from = ymd(s < t ? s : t), to = ymd(e > t ? e : t);
     try {
-      state.entries = (await API.list(from, to)) || [];
+      state.entries = ((await API.list(from, to)) || []).map(x => ({ ...x, start_date: String(x.start_date).slice(0, 10), end_date: String(x.end_date).slice(0, 10) }));
+      setSync(true);
       els.status.textContent = `Updated ${new Date().toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`;
       render();
     } catch (err) { handleError(err); }
@@ -121,15 +209,16 @@ const SETTINGS = {
   }
 
   function pillHTML(e) {
-    const t = e.type === "pto" || isAllDay(e) ? "" : `<span class="t">${esc(timeText(e))}</span>`;
-    return `<button class="pill ${e.type}" data-id="${e.id}" title="${esc(displayTitle(e))}">${esc(displayTitle(e))}${t}</button>`;
+    const t = e.type === "pto" || isAllDay(e) ? "" : `<span class="t">${esc(fmtTime(e.start_time))}</span>`;
+    return `<button class="pill ${e.type}" data-id="${e.id}" title="${esc(displayTitle(e))}">${t}<span class="pt">${esc(displayTitle(e))}</span></button>`;
   }
+
   function cardHTML(e) {
     const meta = [esc(timeText(e))];
     if (e.start_date !== e.end_date) meta.push(`${fmtShort(parse(e.start_date))} – ${fmtShort(parse(e.end_date))}`);
     if (e.location) meta.push(esc(e.location));
     return `<button class="card ${e.type}" data-id="${e.id}">
-      <span class="ctype">${TYPES[e.type].label}</span>
+      <span class="ctype"><span class="dot ${e.type}"></span>${TYPES[e.type].label}</span>
       <span class="ctitle">${esc(displayTitle(e))}</span>
       ${e.type === "contractor" && e.purpose ? `<span class="cmeta">${esc(e.purpose)}</span>` : ""}
       <span class="cmeta">${meta.join(" · ")}</span>
@@ -142,7 +231,7 @@ const SETTINGS = {
     const start = mondayOf(first);
     const last = new Date(f.getFullYear(), month + 1, 0);
     const weeks = Math.ceil((((first.getDay() + 6) % 7) + last.getDate()) / 7);
-    els.period.textContent = f.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+    els.period.innerHTML = `${f.toLocaleDateString(undefined, { month: "long" })} <span class="yr">${f.getFullYear()}</span>`;
     const maxPills = weeks > 5 ? 3 : 4;
     let cells = "";
     for (let i = 0; i < weeks * 7; i++) {
@@ -151,7 +240,7 @@ const SETTINGS = {
       const shown = list.slice(0, maxPills).map(pillHTML).join("");
       const more = list.length > maxPills ? `<button class="more" data-day="${ymd(d)}">+${list.length - maxPills} more</button>` : "";
       cells += `<div class="${cls}">
-        <button class="daynum" data-day="${ymd(d)}"><span class="dn">${d.getDate()}</span><span class="wd">${WD_LONG[i % 7]}</span></button>
+        <button class="daynum" data-day="${ymd(d)}"><span class="dn">${d.getDate()}</span></button>
         <div class="pills">${shown}${more}</div></div>`;
     }
     els.cal.innerHTML = `<div class="dow-row">${WD.map(w => `<div>${w}</div>`).join("")}</div>
@@ -160,12 +249,12 @@ const SETTINGS = {
 
   function renderWeek() {
     const s = mondayOf(state.focus), e = addDays(s, 6);
-    els.period.textContent = `${fmtShort(s)} – ${fmtShort(e)}, ${e.getFullYear()}`;
+    els.period.innerHTML = `${fmtShort(s)} – ${fmtShort(e)} <span class="yr">${e.getFullYear()}</span>`;
     let cols = "";
     for (let i = 0; i < 7; i++) {
       const d = addDays(s, i), list = entriesOn(d);
-      cols += `<div class="wcol ${sameDay(d, today()) ? "today" : ""}">
-        <div class="whead" data-day="${ymd(d)}"><div class="wd">${WD_LONG[i]}</div><div class="dn">${d.getDate()}</div></div>
+      cols += `<div class="wcol ${sameDay(d, today()) ? "today" : ""} ${i >= 5 ? "weekend" : ""}">
+        <div class="whead" data-day="${ymd(d)}"><div class="wd">${WD[i]}</div><div class="dn">${d.getDate()}</div></div>
         <div class="wbody">${list.map(cardHTML).join("") || '<div class="empty">—</div>'}</div></div>`;
     }
     els.cal.innerHTML = `<div class="week-grid">${cols}</div>`;
@@ -173,13 +262,13 @@ const SETTINGS = {
 
   function renderDay() {
     const d = state.focus, list = entriesOn(d);
-    els.period.textContent = d.toLocaleDateString(undefined, { month: "long", day: "numeric", year: "numeric" });
+    els.period.innerHTML = `${d.toLocaleDateString(undefined, { month: "long", day: "numeric" })} <span class="yr">${d.getFullYear()}</span>`;
     const allDay = list.filter(isAllDay), timed = list.filter(e => !isAllDay(e));
     els.cal.innerHTML = `<div class="day-wrap">
-      <div class="day-head"><span class="big">${d.toLocaleDateString(undefined, { weekday: "long" })}</span>
-        ${sameDay(d, today()) ? '<span class="tag">TODAY</span>' : ""}</div>
-      <div class="day-section"><h3>ALL DAY</h3><div class="day-cards">${allDay.map(cardHTML).join("") || '<div class="empty">Nothing all-day</div>'}</div></div>
-      <div class="day-section"><h3>SCHEDULE</h3><div class="day-cards">${timed.map(cardHTML).join("") || '<div class="empty">No timed activities</div>'}</div></div>
+      <div class="day-head"><span class="big">${WD_LONG[(d.getDay() + 6) % 7]}</span>
+        ${sameDay(d, today()) ? '<span class="tag">Today</span>' : ""}</div>
+      <div class="day-section"><h3>All day</h3><div class="day-cards">${allDay.map(cardHTML).join("") || '<div class="empty">Nothing all-day</div>'}</div></div>
+      <div class="day-section"><h3>Schedule</h3><div class="day-cards">${timed.map(cardHTML).join("") || '<div class="empty">No timed activities</div>'}</div></div>
     </div>`;
   }
 
@@ -187,13 +276,13 @@ const SETTINGS = {
     const list = entriesOn(today());
     const by = t => list.filter(e => e.type === t);
     els.todayCounts.innerHTML = `
-      <span class="c"><span class="dot event"></span>${by("event").length} Events</span>
-      <span class="c"><span class="dot contractor"></span>${by("contractor").length} Contractors onsite</span>
-      <span class="c"><span class="dot pto"></span>${by("pto").length} PTO / OOO</span>`;
-    const col = (t, h) => `<div class="today-col"><h4 style="color:var(--${t})">${h}</h4><ul>${
+      <span class="c event"><b>${by("event").length}</b> Events</span>
+      <span class="c contractor"><b>${by("contractor").length}</b> Contractors onsite</span>
+      <span class="c pto"><b>${by("pto").length}</b> Out today</span>`;
+    const col = (t, h) => `<div class="today-col ${t}"><h4>${h}</h4><ul>${
       by(t).map(e => `<li data-id="${e.id}">${esc(e.title)}${e.type !== "pto" && !isAllDay(e) ? ` <span class="muted">· ${fmtTime(e.start_time)}</span>` : ""}</li>`).join("") || '<li class="none">None</li>'
     }</ul></div>`;
-    els.todayBody.innerHTML = col("event", "EVENTS TODAY") + col("contractor", "CONTRACTORS ONSITE") + col("pto", "PTO / OOO TODAY");
+    els.todayBody.innerHTML = col("event", "Events today") + col("contractor", "Contractors onsite") + col("pto", "PTO / OOO today");
   }
 
   // ---------- Toolbar ----------
@@ -226,7 +315,6 @@ const SETTINGS = {
   };
   $("addBtn").onclick = () => openTypeChooser();
 
-  // Calendar clicks
   document.addEventListener("click", ev => {
     const item = ev.target.closest("[data-id]");
     if (item && !els.modal.contains(item)) { const e = state.entries.find(x => String(x.id) === item.dataset.id); if (e) openDetails(e); return; }
@@ -243,7 +331,7 @@ const SETTINGS = {
   function openTypeChooser() {
     openModal(`<h2>What would you like to add?</h2>
       <div class="choice-grid">
-        ${Object.entries(TYPES).map(([k, t]) => `<button class="choice ${k}" data-type="${k}"><span class="dot ${k}"></span>${t.add}</button>`).join("")}
+        ${Object.entries(TYPES).map(([k, t]) => `<button class="choice ${k}" data-type="${k}"><span class="dot ${k}"></span>${t.add}<span class="arrow">›</span></button>`).join("")}
       </div>
       <div class="actions"><button class="btn btn-light" data-close>Cancel</button></div>`);
     els.modalCard.querySelectorAll("[data-type]").forEach(b => (b.onclick = () => openForm({ type: b.dataset.type })));
@@ -256,7 +344,6 @@ const SETTINGS = {
     const e = Object.assign({ start_date: ymd(base), end_date: ymd(base), all_day: t === "pto" }, entry);
     const v = k => esc(e[k] ?? "");
     const time = k => esc((e[k] || "").slice(0, 5));
-
     const titleField = {
       event: `<label class="full">Event title *<input name="title" required value="${v("title")}" placeholder="e.g. Pilot Plant Demo"></label>`,
       contractor: `<label class="full">Contractor / vendor / company *<input name="title" required value="${v("title")}" placeholder="e.g. ABC Electric"></label>
@@ -274,7 +361,7 @@ const SETTINGS = {
       <label class="full">Short notes<textarea name="notes" maxlength="500">${v("notes")}</textarea></label>`;
 
     openModal(`<span class="type-badge ${t}"><span class="dot ${t}"></span>${TYPES[t].label}</span>
-      <h2>${isNew ? TYPES[t].add : "Edit " + TYPES[t].label.toLowerCase()}</h2>
+      <h2>${isNew ? TYPES[t].add : "Edit " + TYPES[t].label}</h2>
       <form class="form" id="entryForm">${titleField}${dates}${allDay}${times}${extra}
         <div class="error full" id="formError"></div>
         <div class="actions full">
@@ -308,13 +395,14 @@ const SETTINGS = {
       if (!out.all_day && t !== "pto" && !out.start_time) return (err.textContent = "Add a start time or select All day.");
       if (out.start_time && out.end_time && out.end_time <= out.start_time) return (err.textContent = "End time must be after start time.");
       if (t === "pto" && !out.start_time) out.all_day = true;
+
       const btn = form.querySelector("[type=submit]"); btn.disabled = true; btn.textContent = "Saving…";
       try {
         const saved = await API.save(out);
         closeModal();
         if (saved && saved.start_date && state.view !== "month") state.focus = parse(saved.start_date);
         await load();
-      } catch (x) { handleError(x); err.textContent = "Could not save. Please try again."; btn.disabled = false; btn.textContent = "Save"; }
+      } catch (x) { handleError(x); err.textContent = "Could not save. Please check the connection and try again."; btn.disabled = false; btn.textContent = "Save"; }
     };
   }
 
@@ -348,7 +436,7 @@ const SETTINGS = {
   }
 
   function confirmBox(title, msg, okText, onOk, onCancel) {
-    openModal(`<h2>${esc(title)}</h2><p>${esc(msg)}</p>
+    openModal(`<h2>${esc(title)}</h2><p class="muted">${esc(msg)}</p>
       <div class="actions"><button class="btn btn-light" data-no>Cancel</button><button class="btn btn-danger" data-yes>${esc(okText)}</button></div>`);
     els.modalCard.querySelector("[data-no]").onclick = () => (onCancel ? onCancel() : closeModal());
     els.modalCard.querySelector("[data-yes]").onclick = async ev => { ev.target.disabled = true; await onOk(); };
